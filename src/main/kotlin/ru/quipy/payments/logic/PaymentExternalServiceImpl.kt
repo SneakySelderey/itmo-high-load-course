@@ -41,13 +41,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         while (true) {
-            var isAllowed = true
-
-            if (!rateLimiter.tick()) {
-                isAllowed = false
-                Thread.sleep(10L)
-            }
-            else if (now() > deadline) {
+            if (now() > deadline) {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), null, reason = "Deadline exceeded")
                 }
@@ -56,8 +50,9 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            if (isAllowed)
-                break
+            if (rateLimiter.tick()) break
+
+            Thread.sleep(10L)
         }
 
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
