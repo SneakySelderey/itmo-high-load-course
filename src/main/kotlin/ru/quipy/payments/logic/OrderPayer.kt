@@ -11,9 +11,9 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class TooManyRequestsException(val retryAfter: Long) : RuntimeException()
 
@@ -35,9 +35,11 @@ class OrderPayer {
 
     private val account by lazy { accounts.first().properties() }
 
-    private val queue by lazy { Semaphore(2 * account.parallelRequests) }
+    private val worstProcessingMillis by lazy { 2 * account.averageProcessingTime.toMillis() }
 
     private val retryAfterMillis by lazy { account.averageProcessingTime.toMillis() / account.parallelRequests }
+
+    private val paymentsInProgress = AtomicInteger(0)
 
     private val accepted = Metrics.counter("payment_requests", "stage", "accepted")
     private val rejected = Metrics.counter("payment_requests", "stage", "rejected")
@@ -54,7 +56,7 @@ class OrderPayer {
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        if (!queue.tryAcquire()) {
+        if (!takePlaceIfInTime(deadline)) {
             rejected.increment()
             throw TooManyRequestsException(System.currentTimeMillis() + retryAfterMillis)
         }
@@ -74,10 +76,21 @@ class OrderPayer {
 
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } finally {
-                queue.release()
+                paymentsInProgress.decrementAndGet()
                 finished.increment()
             }
         }
         return createdAt
+    }
+
+    private fun takePlaceIfInTime(deadline: Long): Boolean {
+        val window = account.parallelRequests
+        while (true) {
+            val inProgress = paymentsInProgress.get()
+            val ahead = maxOf(0, inProgress + 1 - window)
+            val waves = (ahead + window - 1) / window
+            if (System.currentTimeMillis() + (waves + 1) * worstProcessingMillis > deadline) return false
+            if (paymentsInProgress.compareAndSet(inProgress, inProgress + 1)) return true
+        }
     }
 }
