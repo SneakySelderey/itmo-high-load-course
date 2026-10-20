@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -12,6 +13,9 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+class TooManyRequestsException(val retryAfter: Long) : RuntimeException()
 
 @Service
 class OrderPayer {
@@ -26,6 +30,21 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    @Autowired
+    private lateinit var accounts: List<PaymentExternalSystemAdapter>
+
+    private val account by lazy { accounts.first().properties() }
+
+    private val worstProcessingMillis by lazy { 2 * account.averageProcessingTime.toMillis() }
+
+    private val retryAfterMillis by lazy { account.averageProcessingTime.toMillis() / account.parallelRequests }
+
+    private val paymentsInProgress = AtomicInteger(0)
+
+    private val accepted = Metrics.counter("payment_requests", "stage", "accepted")
+    private val rejected = Metrics.counter("payment_requests", "stage", "rejected")
+    private val finished = Metrics.counter("payment_requests", "stage", "finished")
+
     private val paymentExecutor = ThreadPoolExecutor(
         16,
         16,
@@ -37,19 +56,41 @@ class OrderPayer {
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        if (!takePlaceIfInTime(deadline)) {
+            rejected.increment()
+            throw TooManyRequestsException(System.currentTimeMillis() + retryAfterMillis)
+        }
+        accepted.increment()
+
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            try {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
+                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            } finally {
+                paymentsInProgress.decrementAndGet()
+                finished.increment()
+            }
         }
         return createdAt
+    }
+
+    private fun takePlaceIfInTime(deadline: Long): Boolean {
+        val window = account.parallelRequests
+        while (true) {
+            val inProgress = paymentsInProgress.get()
+            val ahead = maxOf(0, inProgress + 1 - window)
+            val waves = (ahead + window - 1) / window
+            if (System.currentTimeMillis() + (waves + 1) * worstProcessingMillis > deadline) return false
+            if (paymentsInProgress.compareAndSet(inProgress, inProgress + 1)) return true
+        }
     }
 }

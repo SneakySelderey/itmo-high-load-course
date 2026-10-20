@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Metrics
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -42,6 +43,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = Semaphore(parallelRequests, true)
 
+    private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
         val acquired = acquireTimeout > 0 && parallelRequestsLimiter.tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)
@@ -73,6 +76,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+            outgoing.increment()
 
             try {
                 val request = Request.Builder().run {
@@ -124,6 +128,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    override fun properties() = properties
 
 }
 
