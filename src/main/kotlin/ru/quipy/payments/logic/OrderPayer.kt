@@ -14,6 +14,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ceil
 
 class TooManyRequestsException(val retryAfter: Long) : RuntimeException()
 
@@ -37,23 +38,35 @@ class OrderPayer {
 
     private val worstProcessingMillis by lazy { 2 * account.averageProcessingTime.toMillis() }
 
-    private val retryAfterMillis by lazy { account.averageProcessingTime.toMillis() / account.parallelRequests }
+    private val throughputPerSec by lazy {
+        minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1000.0 / worstProcessingMillis)
+    }
 
-    private val paymentsInProgress = AtomicInteger(0)
+    private val inFlight by lazy {
+        minOf(account.parallelRequests.toLong(), account.rateLimitPerSec * account.averageProcessingTime.toMillis() / 1000).toInt().coerceAtLeast(1)
+    }
+
+    private val retryAfterMillis by lazy {
+        ceil(1000.0 / minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1000.0 / account.averageProcessingTime.toMillis())).toLong()
+    }
+
+    private val paymentsInProgress = AtomicInteger(0).also { Metrics.gauge("payments_in_progress", it) }
 
     private val accepted = Metrics.counter("payment_requests", "stage", "accepted")
     private val rejected = Metrics.counter("payment_requests", "stage", "rejected")
     private val finished = Metrics.counter("payment_requests", "stage", "finished")
 
-    private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
-        NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
-    )
+    private val paymentExecutor by lazy {
+        ThreadPoolExecutor(
+            inFlight,
+            inFlight,
+            0L,
+            TimeUnit.MILLISECONDS,
+            LinkedBlockingQueue(8_000),
+            NamedThreadFactory("payment-submission-executor"),
+            CallerBlockingRejectedExecutionHandler()
+        )
+    }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         if (!takePlaceIfInTime(deadline)) {
@@ -84,12 +97,11 @@ class OrderPayer {
     }
 
     private fun takePlaceIfInTime(deadline: Long): Boolean {
-        val window = account.parallelRequests
         while (true) {
             val inProgress = paymentsInProgress.get()
-            val ahead = maxOf(0, inProgress + 1 - window)
-            val waves = (ahead + window - 1) / window
-            if (System.currentTimeMillis() + (waves + 1) * worstProcessingMillis > deadline) return false
+            val waiting = maxOf(0, inProgress + 1 - inFlight)
+            val waitMillis = (waiting * 1000 / throughputPerSec).toLong()
+            if (System.currentTimeMillis() + waitMillis + worstProcessingMillis > deadline) return false
             if (paymentsInProgress.compareAndSet(inProgress, inProgress + 1)) return true
         }
     }
