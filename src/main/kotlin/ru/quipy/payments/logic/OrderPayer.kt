@@ -39,7 +39,7 @@ class OrderPayer {
 
     private val retryAfterMillis by lazy { account.averageProcessingTime.toMillis() / account.parallelRequests }
 
-    private val paymentsInProgress = AtomicInteger(0)
+    private val paymentsInProgress = AtomicInteger(0).also { Metrics.gauge("payments_in_progress", it) }
 
     private val accepted = Metrics.counter("payment_requests", "stage", "accepted")
     private val rejected = Metrics.counter("payment_requests", "stage", "rejected")
