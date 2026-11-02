@@ -42,9 +42,7 @@ class OrderPayer {
         minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1000.0 / worstProcessingMillis)
     }
 
-    private val inFlight by lazy {
-        minOf(account.parallelRequests.toLong(), account.rateLimitPerSec * account.averageProcessingTime.toMillis() / 1000).toInt().coerceAtLeast(1)
-    }
+    private val inFlight = 14
 
     private val retryAfterMillis by lazy {
         ceil(1000.0 / minOf(account.rateLimitPerSec.toDouble(), account.parallelRequests * 1000.0 / account.averageProcessingTime.toMillis())).toLong()
@@ -58,8 +56,8 @@ class OrderPayer {
 
     private val paymentExecutor by lazy {
         ThreadPoolExecutor(
-            14,
-            14,
+            inFlight,
+            inFlight,
             0L,
             TimeUnit.MILLISECONDS,
             LinkedBlockingQueue(8_000),
