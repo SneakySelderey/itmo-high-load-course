@@ -24,10 +24,9 @@ class PaymentSystemImpl(
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
-            val worstProcessingTimeMillis = 2 * account.properties().averageProcessingTime.toMillis()
             var attempt = 1
             while (!account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)) {
-                if (attempt >= MAX_ATTEMPTS || now() + worstProcessingTimeMillis > deadline) break
+                if (attempt >= MAX_ATTEMPTS) break
                 attempt++
             }
         }
