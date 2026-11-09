@@ -45,7 +45,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
         val acquired = acquireTimeout > 0 && parallelRequestsLimiter.tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)
 
@@ -57,7 +57,7 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     logger.warn("[$accountName] Deadline exceeded for payment $paymentId")
 
-                    return
+                    return false
                 }
 
                 if (rateLimiter.tick()) break
@@ -99,6 +99,7 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
+                    return body.result
                 }
             } catch (e: Exception) {
                 when (e) {
@@ -118,6 +119,7 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+            return false
         } finally {
             if (acquired) parallelRequestsLimiter.release()
         }
