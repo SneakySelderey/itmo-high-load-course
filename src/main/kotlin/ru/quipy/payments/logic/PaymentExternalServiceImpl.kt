@@ -27,6 +27,7 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+        private const val TIMEOUT_RESPONSE_GRACE_MILLIS = 200L
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
@@ -83,25 +84,39 @@ class PaymentExternalSystemAdapterImpl(
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
             try {
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
-
-                val call = client.newCall(request)
-                val timeoutMillis = minOf(attemptTimeoutMillis, deadline - now())
+                val timeoutMillis = minOf(attemptTimeoutMillis, deadline - now() - TIMEOUT_RESPONSE_GRACE_MILLIS)
                 if (timeoutMillis <= 0) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
                     }
                     return false
                 }
-                call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS)
+                val providerTimeout = Duration.ofMillis(timeoutMillis)
+                val request = Request.Builder().run {
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$providerTimeout")
+                    post(emptyBody)
+                }.build()
+                val call = client.newCall(request)
+                val clientTimeoutMillis = minOf(timeoutMillis + TIMEOUT_RESPONSE_GRACE_MILLIS, deadline - now())
+                if (clientTimeoutMillis <= 0) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                    return false
+                }
+                call.timeout().timeout(clientTimeoutMillis, TimeUnit.MILLISECONDS)
 
                 outgoing.increment()
                 if (attempt > 1) retries.increment()
 
                 call.execute().use { response ->
+                    if (response.code == 408) {
+                        timeouts.increment()
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Provider timeout.")
+                        }
+                        return false
+                    }
                     val responseBody = response.body?.string()
                     val body = try {
                         mapper.readValue(responseBody, ExternalSysResponse::class.java)
