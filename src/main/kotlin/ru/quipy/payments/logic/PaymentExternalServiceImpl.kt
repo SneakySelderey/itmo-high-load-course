@@ -10,7 +10,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
@@ -27,6 +27,7 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+        private const val TIMEOUT_RESPONSE_GRACE_MILLIS = 200L
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
@@ -38,20 +39,25 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .eventListenerFactory(PaymentAttemptLatency(accountName))
+        .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = Semaphore(parallelRequests, true)
 
     private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
+    private val retries = Metrics.counter("payment_retries", "account", accountName)
+    private val timeouts = Metrics.counter("payment_attempt_timeouts", "account", accountName)
+    private val attemptTimeoutMillis = (requestAverageProcessingTime.toMillis() * 3 / 2).coerceAtLeast(1)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, attempt: Int): Boolean {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
         val acquired = acquireTimeout > 0 && parallelRequestsLimiter.tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)
 
         try {
             while (true) {
-                if (!acquired || now() > deadline) {
+                if (!acquired || now() + requestAverageProcessingTime.toMillis() >= deadline) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), null, reason = "Deadline exceeded")
                     }
@@ -76,19 +82,46 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-            outgoing.increment()
 
             try {
+                val timeoutMillis = minOf(attemptTimeoutMillis, deadline - now() - TIMEOUT_RESPONSE_GRACE_MILLIS)
+                if (timeoutMillis <= 0) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                    return false
+                }
+                val providerTimeout = Duration.ofMillis(timeoutMillis)
                 val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$providerTimeout")
                     post(emptyBody)
                 }.build()
+                val call = client.newCall(request)
+                val clientTimeoutMillis = minOf(timeoutMillis + TIMEOUT_RESPONSE_GRACE_MILLIS, deadline - now())
+                if (clientTimeoutMillis <= 0) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                    return false
+                }
+                call.timeout().timeout(clientTimeoutMillis, TimeUnit.MILLISECONDS)
 
-                client.newCall(request).execute().use { response ->
+                outgoing.increment()
+                if (attempt > 1) retries.increment()
+
+                call.execute().use { response ->
+                    if (response.code == 408) {
+                        timeouts.increment()
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Provider timeout.")
+                        }
+                        return false
+                    }
+                    val responseBody = response.body?.string()
                     val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        mapper.readValue(responseBody, ExternalSysResponse::class.java)
                     } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}", e)
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                     }
 
@@ -103,7 +136,8 @@ class PaymentExternalSystemAdapterImpl(
                 }
             } catch (e: Exception) {
                 when (e) {
-                    is SocketTimeoutException -> {
+                    is InterruptedIOException -> {
+                        timeouts.increment()
                         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Request timeout.")

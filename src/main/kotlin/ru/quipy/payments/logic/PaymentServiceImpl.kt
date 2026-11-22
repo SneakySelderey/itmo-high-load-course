@@ -25,7 +25,7 @@ class PaymentSystemImpl(
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
             var attempt = 1
-            while (!account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)) {
+            while (!account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, attempt)) {
                 if (attempt >= MAX_ATTEMPTS) break
                 attempt++
             }
