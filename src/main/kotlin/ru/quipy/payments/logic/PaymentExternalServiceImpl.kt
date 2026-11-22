@@ -10,7 +10,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
@@ -48,6 +48,7 @@ class PaymentExternalSystemAdapterImpl(
     private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
     private val retries = Metrics.counter("payment_retries", "account", accountName)
     private val timeouts = Metrics.counter("payment_attempt_timeouts", "account", accountName)
+    private val attemptTimeoutMillis = (requestAverageProcessingTime.toMillis() * 3 / 2).coerceAtLeast(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, attempt: Int): Boolean {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
@@ -55,7 +56,7 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             while (true) {
-                if (!acquired || now() > deadline) {
+                if (!acquired || now() + requestAverageProcessingTime.toMillis() >= deadline) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), null, reason = "Deadline exceeded")
                     }
@@ -80,7 +81,6 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-            outgoing.increment()
 
             try {
                 val request = Request.Builder().run {
@@ -89,12 +89,24 @@ class PaymentExternalSystemAdapterImpl(
                 }.build()
 
                 val call = client.newCall(request)
+                val timeoutMillis = minOf(attemptTimeoutMillis, deadline - now())
+                if (timeoutMillis <= 0) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                    return false
+                }
+                call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS)
+
+                outgoing.increment()
                 if (attempt > 1) retries.increment()
+
                 call.execute().use { response ->
+                    val responseBody = response.body?.string()
                     val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        mapper.readValue(responseBody, ExternalSysResponse::class.java)
                     } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}", e)
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                     }
 
@@ -109,7 +121,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             } catch (e: Exception) {
                 when (e) {
-                    is SocketTimeoutException -> {
+                    is InterruptedIOException -> {
                         timeouts.increment()
                         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                         paymentESService.update(paymentId) {
