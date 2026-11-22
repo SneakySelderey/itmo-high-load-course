@@ -38,14 +38,18 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .eventListenerFactory(PaymentAttemptLatency(accountName))
+        .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val parallelRequestsLimiter = Semaphore(parallelRequests, true)
 
     private val outgoing = Metrics.counter("payment_requests", "stage", "outgoing")
+    private val retries = Metrics.counter("payment_retries", "account", accountName)
+    private val timeouts = Metrics.counter("payment_attempt_timeouts", "account", accountName)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, attempt: Int): Boolean {
         val acquireTimeout = deadline - now() - requestAverageProcessingTime.toMillis()
         val acquired = acquireTimeout > 0 && parallelRequestsLimiter.tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)
 
@@ -84,7 +88,9 @@ class PaymentExternalSystemAdapterImpl(
                     post(emptyBody)
                 }.build()
 
-                client.newCall(request).execute().use { response ->
+                val call = client.newCall(request)
+                if (attempt > 1) retries.increment()
+                call.execute().use { response ->
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
@@ -104,6 +110,7 @@ class PaymentExternalSystemAdapterImpl(
             } catch (e: Exception) {
                 when (e) {
                     is SocketTimeoutException -> {
+                        timeouts.increment()
                         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
